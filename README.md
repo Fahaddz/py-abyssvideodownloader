@@ -1,5 +1,7 @@
 # py-abyss
 
+Credit: this project is a Python downloader-only rewrite inspired by the original [AbyssVideoDownloader](https://github.com/abdlhay/AbyssVideoDownloader) project.
+
 `py-abyss` is a fast, resumable command-line downloader for Abyss video IDs and Abyss URLs. It is standalone Python: no Java, no Gradle, and no `abyss-dl.jar`.
 
 ## Features
