@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Downloader runtime files
+.abyss-temp/
+*.part
+*.tmp
+*.log
+
+# Downloaded media
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
