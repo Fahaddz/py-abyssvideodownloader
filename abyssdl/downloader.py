@@ -15,10 +15,15 @@ from .constants import (
     DEFAULT_RETRIES,
     DEFAULT_RETUNE_THRESHOLD_MBPS,
     DEFAULT_TIMEOUT,
+    FAST_CONNECTION_CANDIDATES,
     FRAGMENT_SIZE,
+    PROBE_BYTES,
+    PROBE_SEGMENTS_PER_CANDIDATE,
+    PROBE_TIMEOUT,
     READ_CHUNK_SIZE,
 )
 from .models import DownloadPlan
+from .pool import close_thread_conns, fetch_full_stream, fetch_range
 from .segments import build_segment_url, expected_segment_size
 
 ProgressCallback = Callable[[int, int], None]
@@ -37,6 +42,7 @@ class DownloadOptions:
     keep_temp: bool = False
     status: StatusCallback | None = None
     retune_below_mbps: float = DEFAULT_RETUNE_THRESHOLD_MBPS
+    thorough: bool = False
 
 
 def sanitize_filename(value: str) -> str:
@@ -137,21 +143,28 @@ def _download_segment(
         try:
             if part_path.exists():
                 part_path.unlink()
-            with fetch_binary_response(url, options.headers, options.timeout) as resp:
-                with part_path.open("wb") as out:
-                    while True:
-                        chunk = resp.read(READ_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        written += len(chunk)
-                        if progress:
-                            progress(len(chunk), 0)
-            if part_path.stat().st_size != expected_size:
-                raise IOError(f"segment {index} size mismatch")
+            # Keep-alive pooled fetch: reuses the thread's TLS connection.
+            with part_path.open("wb") as out:
+                def _on_chunk(data: bytes) -> None:
+                    nonlocal written
+                    out.write(data)
+                    written += len(data)
+                    if progress:
+                        progress(len(data), 0)
+
+                total = fetch_full_stream(
+                    url,
+                    options.headers,
+                    options.timeout,
+                    chunk_size=READ_CHUNK_SIZE,
+                    on_chunk=_on_chunk,
+                )
+            if total != expected_size or part_path.stat().st_size != expected_size:
+                raise IOError(f"segment {index} size mismatch ({total} != {expected_size})")
             os.replace(part_path, final_path)
             return expected_size
         except Exception:
+            close_thread_conns()
             if progress and written:
                 progress(-written, 0)
             if attempt >= options.retries:
@@ -160,6 +173,35 @@ def _download_segment(
                 raise
             time.sleep(min(2.0, 0.4 * (attempt + 1)))
     raise RuntimeError("unreachable")
+
+
+def _probe_bytes(
+    plan: DownloadPlan,
+    options: DownloadOptions,
+    index: int,
+) -> int:
+    """Download only the first PROBE_BYTES of a segment (Range request).
+
+    Used for fast auto-tuning: measures CDN throughput without paying for
+    full 2 MB segments or writing anything to disk. Returns bytes fetched.
+    """
+    token = plan.tokens[index % len(plan.tokens)]
+    url = build_segment_url(plan.base_url, plan.total_size, token)
+    size = min(PROBE_BYTES, expected_segment_size(index % len(plan.tokens), plan.total_size))
+    try:
+        body, status = fetch_range(
+            url,
+            options.headers,
+            PROBE_TIMEOUT,
+            start=0,
+            end=size - 1,
+        )
+    except Exception:
+        close_thread_conns()
+        raise
+    if status not in (200, 206) or not body:
+        raise IOError(f"probe {index} failed: HTTP {status}")
+    return len(body)
 
 
 def _download_many(
@@ -220,6 +262,62 @@ def _rate_mbps(bytes_done: int, elapsed: float) -> float:
     return bytes_done / max(elapsed, 0.001) / (1024 * 1024)
 
 
+def _probe_many(
+    plan: DownloadPlan,
+    options: DownloadOptions,
+    indexes: list[int],
+    workers: int,
+) -> int:
+    """Fetch PROBE_BYTES from each index in parallel. Returns total bytes."""
+    if not indexes:
+        return 0
+    worker_count = max(1, min(workers, len(indexes)))
+    total = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {executor.submit(_probe_bytes, plan, options, i): i for i in indexes}
+        for future in as_completed(futures):
+            total += future.result()
+    return total
+
+
+def bench_connections(
+    plan: DownloadPlan,
+    options: DownloadOptions,
+    candidates: tuple[int, ...] | list[int] | None = None,
+    probe_segments: int = PROBE_SEGMENTS_PER_CANDIDATE,
+    status: StatusCallback | None = None,
+    start_offset: int = 0,
+) -> list[tuple[int, float]]:
+    """Fast benchmark: Range-probe each candidate, return [(conns, MB/s)].
+
+    Cost: len(candidates) * probe_segments * 1 MB (default 4x3 = 12 MB)
+    instead of the old 192 full segments (~384 MB). Takes seconds, and
+    downloads nothing to disk so it never pollutes resume state.
+    """
+    if candidates is None:
+        candidates = FAST_CONNECTION_CANDIDATES if not options.thorough else AUTO_CONNECTION_CANDIDATES
+    results: list[tuple[int, float]] = []
+    cursor = start_offset
+    for candidate in candidates:
+        sample = list(range(cursor, cursor + probe_segments))
+        cursor += probe_segments
+        if status:
+            status(f"Probing {candidate} connections ({probe_segments} x 1 MB samples)...")
+        try:
+            start = time.perf_counter()
+            bytes_done = _probe_many(plan, options, sample, candidate)
+            rate = _rate_mbps(bytes_done, time.perf_counter() - start)
+        except Exception as exc:
+            if status:
+                status(f"{candidate} connections: failed ({exc})")
+            results.append((candidate, 0.0))
+            continue
+        if status:
+            status(f"{candidate} connections: {rate:.1f} MB/s")
+        results.append((candidate, rate))
+    return results
+
+
 def _retune_connections(
     plan: DownloadPlan,
     options: DownloadOptions,
@@ -228,25 +326,36 @@ def _retune_connections(
     progress: ProgressCallback | None,
     heading: str,
 ) -> tuple[int, float]:
-    best_connections = 16
-    best_rate = 0.0
+    # Thorough mode preserves the old behavior: download real segments per
+    # candidate and keep them. Slow (~384 MB) but measures full writes.
+    if options.thorough:
+        best_connections = 16
+        best_rate = 0.0
+        _status(options, heading + " (thorough: full segments)")
+        for candidate in AUTO_CONNECTION_CANDIDATES:
+            if not remaining:
+                break
+            sample_count = min(candidate, len(remaining))
+            sample = remaining[:sample_count]
+            _status(options, f"Testing {candidate} connections on {sample_count} segments...")
+            start = time.perf_counter()
+            bytes_done = _download_many(plan, options, temp_dir, sample, candidate, progress)
+            rate = _rate_mbps(bytes_done, time.perf_counter() - start)
+            _status(options, f"{candidate} connections: {rate:.1f} MB/s")
+            if rate > best_rate:
+                best_rate = rate
+                best_connections = candidate
+            del remaining[:sample_count]
+        return best_connections, best_rate
 
-    _status(options, heading)
-    for candidate in AUTO_CONNECTION_CANDIDATES:
-        if not remaining:
-            break
-        sample_count = min(candidate, len(remaining))
-        sample = remaining[:sample_count]
-        _status(options, f"Testing {candidate} connections on {sample_count} segments...")
-        start = time.perf_counter()
-        bytes_done = _download_many(plan, options, temp_dir, sample, candidate, progress)
-        rate = _rate_mbps(bytes_done, time.perf_counter() - start)
-        _status(options, f"{candidate} connections: {rate:.1f} MB/s")
-        if rate > best_rate:
-            best_rate = rate
-            best_connections = candidate
-        del remaining[:sample_count]
-
+    # Fast path (default): 1 MB Range probes, ~12 MB total, nothing written.
+    _status(options, heading + " (fast probe: ~12 MB, seconds)")
+    results = bench_connections(plan, options, status=lambda m: _status(options, m))
+    if not results:
+        return 16, 0.0
+    best_connections, best_rate = max(results, key=lambda r: r[1])
+    if best_rate <= 0:
+        best_connections, best_rate = 16, 0.0
     return best_connections, best_rate
 
 
@@ -260,6 +369,12 @@ def _download_adaptive_batches(
 ) -> None:
     current_connections = connections
     threshold = max(0.0, options.retune_below_mbps)
+    # Track the tuned rate so slow-but-stable routes don't retune-loop:
+    # only re-probe on a *significant* drop, not merely "below threshold".
+    tuned_rate = 0.0
+    # Peek at last probe result via a cheap single-probe? Instead, use the
+    # first batch as the baseline when tuned_rate is unknown.
+    first_batch = True
 
     while remaining:
         batch_size = min(len(remaining), max(16, min(current_connections * 2, 96)))
@@ -269,7 +384,19 @@ def _download_adaptive_batches(
         rate = _rate_mbps(bytes_done, time.perf_counter() - start)
         del remaining[:batch_size]
 
-        if threshold > 0 and rate < threshold and len(remaining) >= AUTO_CONNECTION_CANDIDATES[0]:
+        if first_batch:
+            tuned_rate = rate
+            first_batch = False
+        else:
+            tuned_rate = max(tuned_rate, rate)
+
+        significant_drop = rate < 0.5 * tuned_rate if tuned_rate > 0 else False
+        if (
+            threshold > 0
+            and rate < threshold
+            and significant_drop
+            and len(remaining) >= AUTO_CONNECTION_CANDIDATES[0]
+        ):
             _status(
                 options,
                 f"Speed dropped to {rate:.1f} MB/s below {threshold:.1f} MB/s; re-tuning connections...",

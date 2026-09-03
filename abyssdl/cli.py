@@ -19,8 +19,15 @@ from rich.progress import (
 from rich.prompt import Prompt
 from rich.table import Table
 
-from .constants import DEFAULT_CONNECTIONS, DEFAULT_RETRIES, DEFAULT_RETUNE_THRESHOLD_MBPS, DEFAULT_TIMEOUT, MAX_CONNECTIONS
-from .downloader import DownloadOptions, default_output_path, download_plan
+from .constants import (
+    DEFAULT_CONNECTIONS,
+    DEFAULT_RETRIES,
+    DEFAULT_RETUNE_THRESHOLD_MBPS,
+    DEFAULT_TIMEOUT,
+    MAX_CONNECTIONS,
+    PROBE_SEGMENTS_PER_CANDIDATE,
+)
+from .downloader import DownloadOptions, bench_connections, default_output_path, download_plan
 from .metadata import get_metadata, normalize_video_id
 from .models import Mp4Metadata, VideoSource
 from .segments import active_sources, build_download_plan, select_source
@@ -74,6 +81,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing temp segments")
     parser.add_argument("--keep-temp", action="store_true", help="Keep temp files after success")
     parser.add_argument("--list", action="store_true", help="Only list available qualities")
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Fast speed test only: probe connection counts with ~12 MB of Range requests, no full download",
+    )
+    parser.add_argument(
+        "--thorough",
+        action="store_true",
+        help="Use slow thorough auto-tuning (full segments per candidate, old behavior) instead of the fast 1 MB probe",
+    )
+    parser.add_argument(
+        "--probe-segments",
+        type=int,
+        default=PROBE_SEGMENTS_PER_CANDIDATE,
+        help=f"1 MB samples per candidate in --bench / fast auto-tune, default {PROBE_SEGMENTS_PER_CANDIDATE}",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show debug details")
     parser.add_argument("--input-file", help="Read video IDs or URLs from a file")
     args = parser.parse_args(argv)
@@ -82,6 +105,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.retries = max(0, args.retries)
     args.timeout = max(1, args.timeout)
     args.retune_below = max(0.0, args.retune_below)
+    args.probe_segments = max(1, min(8, args.probe_segments))
     return args
 
 
@@ -195,7 +219,40 @@ def run_one(entry: tuple[str, str | None], args: argparse.Namespace, single: boo
         keep_temp=args.keep_temp,
         status=lambda message: console.print(f"[dim]{message}[/dim]"),
         retune_below_mbps=args.retune_below,
+        thorough=args.thorough,
     )
+
+    if args.bench:
+        from .constants import AUTO_CONNECTION_CANDIDATES, FAST_CONNECTION_CANDIDATES
+
+        candidates = AUTO_CONNECTION_CANDIDATES if args.thorough else FAST_CONNECTION_CANDIDATES
+        console.print(
+            f"Benchmarking [bold]{video_id}[/bold] [{source.label or source.res_id}] "
+            f"({len(candidates)} candidates x {args.probe_segments} x 1 MB probes)..."
+        )
+        import time as _time
+
+        t0 = _time.perf_counter()
+        results = bench_connections(
+            plan,
+            options,
+            candidates=candidates,
+            probe_segments=max(1, args.probe_segments),
+            status=lambda m: console.print(f"[dim]{m}[/dim]"),
+        )
+        dt = _time.perf_counter() - t0
+        table = Table(title=f"Bench results for {video_id} [{source.label or '?'}] ({dt:.1f}s, ~{sum(max(1, args.probe_segments) for _ in candidates)} MB)")
+        table.add_column("Connections", justify="right")
+        table.add_column("Speed", justify="right")
+        table.add_column("Verdict", justify="left")
+        best = max(results, key=lambda r: r[1]) if results else (0, 0.0)
+        for conns, rate in sorted(results, key=lambda r: -r[1]):
+            mark = " <-- best" if conns == best[0] else ""
+            table.add_row(str(conns), f"{rate:.1f} MB/s", mark)
+        console.print(table)
+        if results:
+            console.print(f"[green]Recommend:[/green] -c {best[0]} ({best[1]:.1f} MB/s)")
+        return None
 
     connection_label = "auto-tuned connections" if args.connections <= 0 else f"{args.connections} connections"
     console.print(f"Downloading [bold]{video_id}[/bold] [{source.label or source.res_id}] with {connection_label} -> {output}")

@@ -9,8 +9,11 @@ Credit: this project is a Python downloader-only rewrite inspired by the origina
 - Download from a raw Abyss video ID or an Abyss URL.
 - Interactive mode when no input is provided.
 - Quality selection by `best`, `high`, `h`, `medium`, `m`, `low`, `l`, `worst`, exact label, or exact `res_id`.
-- Auto connection tuning against the current CDN route.
-- Adaptive re-tuning during a download with `--retune-below`.
+- Auto connection tuning against the current CDN route (fast 1 MB probes, ~12 MB total).
+- Fast `--bench` speed test: pick the best connection count in seconds without downloading.
+- Keep-alive connection reuse per worker (no TLS handshake per segment).
+- Adaptive re-tuning during a download only on significant drops (no retune loops on slow routes).
+- Thorough `--thorough` tuning mode preserving the old full-segment benchmark.
 - Resume support with validated segment files.
 - Atomic final writes using `.part` output files.
 - Stubborn retry and recovery passes for slow or failed segments.
@@ -107,9 +110,12 @@ uv run abyss-download "id1 h,id2 m,id3 l"
 | `-o, --output FILE` | Output file path for a single video. |
 | `--out-dir DIR` | Directory for automatic filenames. Defaults to the current directory. |
 | `-c, --connections VALUE` | `auto` or a fixed number from `1` to `64`. Defaults to `auto`. |
+| `--bench` | Fast speed test only: probe candidates with ~12 MB of Range requests, print table, exit. |
+| `--thorough` | Slow thorough auto-tuning with full segments per candidate (old behavior). |
+| `--probe-segments N` | 1 MB samples per candidate for `--bench` / fast auto-tune (1-8, default `3`). |
 | `-H, --header "Name: Value"` | Extra HTTP header. Can be repeated. |
-| `--retries N` | Retries per segment. Default: `20`. |
-| `--timeout SECONDS` | Network timeout per request. Default: `180`. |
+| `--retries N` | Retries per segment. Default: `8`. |
+| `--timeout SECONDS` | Network timeout per request. Default: `60`. |
 | `--retune-below MBPS` | In auto mode, re-test connection counts when batch speed drops below this MB/s. Default: `6.0`. |
 | `--overwrite` | Replace the exact `-o` target if it exists. |
 | `--no-resume` | Ignore existing temp segments and start fresh. |
@@ -120,19 +126,46 @@ uv run abyss-download "id1 h,id2 m,id3 l"
 
 ## Speed Tuning
 
-Auto mode benchmarks real segments at several connection counts:
+Auto mode probes the current CDN route with 1 MB Range requests before downloading:
 
 ```text
-8, 16, 24, 32, 48, 64
+8, 16, 24, 32  (3 x 1 MB samples each = ~12 MB total, a few seconds)
 ```
 
-It keeps the downloaded benchmark segments, picks the fastest result, and continues with that connection count. During the download, it processes batches and checks the batch speed. If speed drops below `--retune-below`, it runs the connection benchmark again against the current CDN throttle state and continues with the new best value.
+It picks the fastest result and downloads everything with keep-alive
+connections (one persistent HTTPS connection per worker, no TLS handshake
+per 2 MB segment). During the download it processes batches and only
+re-probes when batch speed drops below `--retune-below` **and** below half
+of the best rate seen so far, so slow-but-stable routes never get stuck in
+a re-tune loop. Pass `--retune-below 0` to disable re-tuning entirely.
 
-Use `-c N` to disable auto tuning and force a fixed connection count:
+Fast speed test without downloading (the recommended way to compare routes):
+
+```powershell
+uv run abyss-download 2QIvEC032 -q best --bench
+```
+
+This prints a per-candidate MB/s table and a `-c N` recommendation in
+seconds. Use `--probe-segments 5` for a slightly longer but steadier sample.
+
+Use `-c N` to skip tuning with a fixed connection count (use the `--bench`
+recommendation):
 
 ```powershell
 uv run abyss-download 2QIvEC032 -q best -c 24
 ```
+
+For the old behavior (benchmark with full 2 MB segments per candidate,
+~384 MB of tuning traffic), pass `--thorough`:
+
+```powershell
+uv run abyss-download 2QIvEC032 -q best --thorough
+```
+
+For the fastest speeds: prefer auto mode on a wired/low-latency link, keep
+the defaults (`--bench` first, then download), and avoid forcing 48-64
+connections — the CDN throttles very high concurrency and more connections
+then measure *slower*, not faster.
 
 ## Resume And Reliability
 
@@ -156,15 +189,16 @@ download.bat         Windows uv launcher
 pyproject.toml       Project metadata and uv entry point
 uv.lock              Locked dependency versions
 abyssdl/
-  cli.py             Command-line interface
-  client.py          HTTP helpers
+  cli.py             Command-line interface (--bench, --thorough)
+  client.py          HTTP helpers (legacy per-request fetches)
+  pool.py            Keep-alive HTTPS pool + Range probes (fast path)
   constants.py       Runtime defaults
   crypto.py          Abyss-compatible crypto helpers
   downloader.py      Parallel/resumable download engine
   metadata.py        Abyss page metadata extraction
   models.py          Dataclasses
   segments.py        Quality selection and segment token generation
-tests/               Unit tests
+tests/               Unit tests (incl. fast probe tests, no network)
 ```
 
 ## Troubleshooting
